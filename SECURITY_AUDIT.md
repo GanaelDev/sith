@@ -1,137 +1,186 @@
 # Security Audit — Sith
 
 **Repository:** `GanaelDev/sith`  
-**Branch audited:** `master`  
+**Branch:** `master`  
 **Audit date:** 2026-09-08  
-**Scope:** source tree, Django configuration, environment configuration, CI/CD workflows, dependency declarations, and repository-level security posture available through GitHub.
+**Audit type:** source-code, architecture, configuration, authentication/authorization, payment-flow and CI/CD security review  
+**Overall risk:** **HIGH**
 
-> **Important:** this is a repository/code audit, not a penetration test. Runtime infrastructure, production server configuration, GitHub secret values, database contents, network exposure, and historical objects that are not observable through the available repository APIs were not fully verified. Findings marked as "À confirmer" require runtime or privileged verification.
-
-## 1. Executive summary
-
-### Overall assessment
-
-**Risk level: HIGH**
-
-The application benefits from several good security foundations: Django's CSRF middleware is enabled, Jinja autoescaping is enabled, `SecurityMiddleware` and clickjacking protection are present, secrets are intended to come from environment variables, `.env` and SQLite databases are ignored by Git, and the project uses Dependabot plus automated tests/linting.
-
-However, the current configuration contains several high-impact weaknesses, especially around production hardening:
-
-1. `ALLOWED_HOSTS = ["*"]` removes Django's host-header restriction.
-2. `SITH_DEBUG` is environment-controlled and there is no repository-level fail-closed production guard preventing a dangerous production configuration.
-3. HTTPS security flags are conditional on `HTTPS`; the example environment explicitly sets `HTTPS=off`, making it easy to deploy an insecure configuration accidentally.
-4. The production deployment executes remote shell commands through a GitHub Action and performs `git reset --hard`, package installation, migrations, and service restart directly on the production host. This is powerful and should be treated as a privileged deployment boundary.
-5. GitHub Actions dependencies are not consistently pinned to immutable commit SHAs.
-6. The repository is public, while the application appears to handle authentication, subscriptions, e-commerce/accounting, forum, student profiles, and other potentially sensitive data. This makes accidental disclosure of configuration, fixtures, logs, exports, or historical secrets particularly important to investigate.
-7. The available static review could not establish that all authorization boundaries are correct across the application's many Django apps/API endpoints. This is the largest area requiring a dedicated authorization-focused review.
-
-## 2. Findings by severity
-
-| ID | Severity | Finding | Confidence |
-|---|---|---|---|
-| SEC-001 | **HIGH** | `ALLOWED_HOSTS = ["*"]` | Confirmed |
-| SEC-002 | **HIGH** | Production security relies heavily on environment correctness; no fail-closed production configuration | Confirmed / architectural |
-| SEC-003 | **HIGH** | HTTPS/session/CSRF hardening is conditional and example defaults to `HTTPS=off` | Confirmed |
-| SEC-004 | **HIGH** | Privileged production deployment over SSH from GitHub Actions | Confirmed |
-| SEC-005 | **MEDIUM-HIGH** | GitHub Actions use mutable version tags instead of immutable SHAs | Confirmed |
-| SEC-006 | **MEDIUM** | Public repository + broad application scope increases impact of accidental secret/data exposure | Confirmed / risk assessment |
-| SEC-007 | **MEDIUM** | Dependency security is not independently verified by this audit | Needs verification |
-| SEC-008 | **MEDIUM** | No evidence from inspected workflows of dedicated SAST/secret scanning/dependency security gates | Confirmed for inspected CI |
-| SEC-009 | **MEDIUM** | Security headers are only partially hardened | Confirmed / needs runtime verification |
-| SEC-010 | **MEDIUM** | Authorization/API access control requires a dedicated endpoint-by-endpoint audit | Needs deeper review |
-| SEC-011 | **LOW-MEDIUM** | `.env.example` contains a realistic-looking secret-shaped value despite being documented as non-production | Confirmed |
-| SEC-012 | **LOW-MEDIUM** | CI executes with broad repository contents and should follow least-privilege workflow permissions | Needs verification |
+> **Important limitation:** this is a deep static audit of the repository. It is **not** a penetration test and does not prove the absence of vulnerabilities. Production infrastructure, reverse-proxy configuration, firewall rules, GitHub secret values, database contents, real traffic, deployed dependency versions, historical Git objects and runtime behavior were not fully observable. Findings marked **VERIFY** require runtime or privileged verification.
 
 ---
 
-## 3. Detailed findings
+## 1. Executive summary
 
-### SEC-001 — `ALLOWED_HOSTS = ["*"]`
+Sith is a large Django application with a broad attack surface: authentication, user profiles, subscriptions, clubs, counters, e-commerce, invoices, payments, forum, elections, file storage, administration and an API. The repository also contains a privileged production deployment pipeline.
 
-**Severity:** HIGH  
-**Status:** Confirmed  
+The application already has a number of useful security foundations:
+
+- Django CSRF middleware is enabled.
+- Jinja autoescaping is enabled.
+- Django `SecurityMiddleware` and clickjacking protection are enabled.
+- `DEBUG` defaults to `False`.
+- `SECRET_KEY` is loaded from the environment.
+- Session and CSRF cookie security can be enabled.
+- API keys are stored as hashes rather than plaintext.
+- Object-level permission classes exist for the API.
+- `.env`, SQLite databases, logs and several generated directories are ignored by Git.
+- Dependabot is configured.
+- Tests and linting run in CI.
+- Xapian artifacts have explicit hashes.
+
+Despite these controls, the current security posture should be considered **HIGH RISK** until production hardening and authorization/payment testing are completed.
+
+The most important issues are not a single obvious remote-code-execution primitive; they are **security-boundary weaknesses** that could turn a smaller bug into a major compromise:
+
+1. `ALLOWED_HOSTS = ["*"]` disables Django host-header validation.
+2. Production security depends too heavily on environment values and does not fail closed on unsafe combinations.
+3. The example configuration explicitly disables HTTPS and enables debug mode, creating dangerous deployment foot-guns.
+4. Production deployment grants a GitHub workflow powerful SSH access and runs `sudo systemctl restart uwsgi` remotely.
+5. Third-party GitHub Actions are not pinned to immutable commit SHAs.
+6. The API has a custom API-key authentication model and a custom permission system; this deserves systematic BOLA/IDOR testing.
+7. Payment callbacks are security-sensitive and currently expose internal exception representations in HTTP 500 responses.
+8. Payment signature verification uses RSA PKCS#1 v1.5 + SHA-1, which is legacy cryptography and should be migrated if the payment provider supports a modern scheme.
+9. Financial calculations convert database currency values to Python `float`, which creates avoidable precision and integrity risks.
+10. The application stores significant personal and financial information, so file access, exports, logs, caching and authorization need to be treated as high-value assets.
+11. CI currently focuses on quality/tests rather than a complete security gate.
+12. The deployment model installs dependencies and performs migrations directly on the production host instead of deploying an immutable artifact.
+
+---
+
+# 2. Risk matrix
+
+| ID | Severity | Area | Finding | Status |
+|---|---|---|---|---|
+| SEC-001 | **CRITICAL/HIGH** | Django | Wildcard `ALLOWED_HOSTS` | Confirmed |
+| SEC-002 | **HIGH** | Production config | No fail-closed production security profile | Confirmed |
+| SEC-003 | **HIGH** | Transport | HTTPS/security cookies are configurable; example disables HTTPS | Confirmed |
+| SEC-004 | **HIGH** | CI/CD | GitHub Actions has privileged SSH deployment capability | Confirmed |
+| SEC-005 | **HIGH** | Supply chain | Deployment executes mutable third-party action references | Confirmed |
+| SEC-006 | **HIGH** | Authorization | Application-wide object authorization needs systematic BOLA/IDOR testing | Verify / high priority |
+| SEC-007 | **HIGH** | Payments | Payment callback exposes internal exception details | Confirmed |
+| SEC-008 | **HIGH** | Payments | Legacy SHA-1/PKCS#1 v1.5 signature verification | Confirmed / provider-dependent |
+| SEC-009 | **HIGH** | Financial integrity | Monetary totals converted to `float` | Confirmed |
+| SEC-010 | **HIGH** | Data protection | File/media authorization must be audited end-to-end | Verify / high priority |
+| SEC-011 | **MEDIUM-HIGH** | API | Custom API-key and permission model requires negative testing | Verify |
+| SEC-012 | **MEDIUM-HIGH** | Deployment | Direct package installation and migrations on production | Confirmed |
+| SEC-013 | **MEDIUM** | CI | No visible dedicated SAST/secret/dependency security gate | Confirmed |
+| SEC-014 | **MEDIUM** | CI | Workflow permissions are not explicitly least-privilege | Verify |
+| SEC-015 | **MEDIUM** | HTTP | Security headers are incomplete at application level | Confirmed / runtime verify |
+| SEC-016 | **MEDIUM** | Secrets | Secret history/fixtures/artifacts require dedicated scanning | Verify |
+| SEC-017 | **MEDIUM** | Authentication | Session/authentication implementation is custom and must be tested as a boundary | Verify |
+| SEC-018 | **MEDIUM** | Business logic | Basket/payment concurrency and replay protection require regression tests | Partially mitigated |
+| SEC-019 | **MEDIUM** | Privacy | Logs and error reporting may expose sensitive operational data | Verify |
+| SEC-020 | **MEDIUM** | Dependencies | Full resolved dependency vulnerability state not independently verified | Verify |
+| SEC-021 | **LOW-MEDIUM** | Configuration | `.env.example` contains realistic secret-shaped material | Confirmed |
+| SEC-022 | **LOW-MEDIUM** | API | API key lookup/rotation/audit lifecycle should be strengthened | Recommendation |
+| SEC-023 | **LOW-MEDIUM** | Availability | Unbounded/large formset and expensive operations need DoS controls | Verify |
+| SEC-024 | **LOW-MEDIUM** | Database | Indexing/constraint review needed for security-sensitive queries | Verify |
+
+---
+
+# 3. Detailed findings and resolutions
+
+## SEC-001 — Wildcard `ALLOWED_HOSTS`
+
+**Severity: HIGH**  
 **Location:** `sith/settings.py`
 
-The Django configuration explicitly sets:
+Current configuration:
 
 ```python
 ALLOWED_HOSTS = ["*"]
 ```
 
-This disables Django's normal host allow-list protection. A production deployment should normally restrict hosts to the exact domains expected by the application.
+This disables Django's Host-header validation.
 
-### Impact
+### Why this matters
 
-An attacker may be able to abuse an unexpected `Host` header. The exact exploitability depends on reverse-proxy configuration and how absolute URLs, redirects, password reset links, emails, caching, and other host-dependent behavior are implemented.
+The `Host` header participates in URL construction, redirects, password reset links and other host-dependent behavior. A wildcard does not automatically produce an exploit, but it removes an important Django security boundary.
 
-### Recommendation
+### Resolution
 
-Replace the wildcard with an environment-driven allow-list, for example:
+Use an explicit environment list:
 
 ```python
 ALLOWED_HOSTS = env.list("ALLOWED_HOSTS", default=[])
 ```
 
-Then configure production explicitly, e.g.:
+Production:
 
 ```text
-ALLOWED_HOSTS=ae.utbm.fr,www.ae.utbm.fr
+ALLOWED_HOSTS=ae.utbm.fr
 ```
 
-Do not use `*` in production.
+If multiple canonical hosts are required, enumerate them explicitly.
+
+### Tests to add
+
+- request with an unknown `Host` returns `400`;
+- canonical host remains accepted;
+- password-reset/absolute URLs never use an attacker-controlled host;
+- reverse proxy preserves the expected host behavior.
 
 ---
 
-### SEC-002 — No fail-closed production security profile
+## SEC-002 — No fail-closed production security profile
 
-**Severity:** HIGH  
-**Status:** Confirmed / architectural  
-**Location:** `sith/settings.py`, `.env.example`
+**Severity: HIGH**  
+**Location:** `sith/settings.py`, environment configuration
 
-The application reads security-sensitive settings from environment variables:
+The project correctly reads several security-sensitive settings from the environment, but unsafe production combinations are not prevented at application startup.
 
-- `SECRET_KEY`
-- `SITH_DEBUG`
-- `HTTPS`
-- `CSRF_TRUSTED_ORIGINS`
-- `DATABASE_URL`
-- cache/broker URLs
+Examples:
 
-This is a good twelve-factor pattern, but the application does not appear to enforce a strong production security profile when these values are unsafe.
+- `DEBUG=true`
+- `HTTPS=off`
+- wildcard hosts
+- SQLite in production
+- dummy email backend in production
 
-`DEBUG` defaults to `False`, which is good, but `HTTPS` defaults to `True` while the example explicitly changes it to `off`. More importantly, there is no visible invariant such as "production cannot start if DEBUG is enabled" or "production cannot start with wildcard hosts".
+### Resolution
 
-### Recommendation
+Create explicit environment validation, ideally in a dedicated production configuration module.
 
-Create explicit environment modes and fail fast in production:
+Recommended invariants:
 
 ```python
-if not TESTING and not DEBUG:
-    assert ALLOWED_HOSTS != ["*"]
+if ENVIRONMENT == "production":
+    if DEBUG:
+        raise RuntimeError("DEBUG must be disabled in production")
+    if not ALLOWED_HOSTS or "*" in ALLOWED_HOSTS:
+        raise RuntimeError("Production ALLOWED_HOSTS is invalid")
+    if not SESSION_COOKIE_SECURE:
+        raise RuntimeError("Secure session cookies are required")
+    if not CSRF_COOKIE_SECURE:
+        raise RuntimeError("Secure CSRF cookies are required")
 ```
 
-Prefer a dedicated production settings layer or explicit startup checks rather than relying on operator discipline.
+Also reject SQLite in production if PostgreSQL is the supported production database.
 
-Add automated configuration tests asserting:
+### Better architecture
 
-- `DEBUG=False` in production
-- `ALLOWED_HOSTS` is non-empty and contains no wildcard
-- HTTPS is enabled
-- secure cookies are enabled
-- HSTS is enabled when appropriate
-- trusted origins are explicitly configured
-- production database is not SQLite
-- production email backend is not the dummy backend
+Use:
+
+```text
+sith/settings/base.py
+sith/settings/test.py
+sith/settings/development.py
+sith/settings/production.py
+```
+
+or one settings file with a strict `ENVIRONMENT` switch.
+
+Do not make critical production controls silently configurable to insecure values.
 
 ---
 
-### SEC-003 — HTTPS, session and CSRF security are conditional
+## SEC-003 — HTTPS security is still operator-controlled
 
-**Severity:** HIGH  
-**Status:** Confirmed  
+**Severity: HIGH**  
 **Location:** `sith/settings.py`, `.env.example`
 
-The settings contain:
+Current settings make cookie security depend on:
 
 ```python
 HTTPS = env.bool("HTTPS", default=True)
@@ -139,443 +188,1700 @@ CSRF_COOKIE_SECURE = HTTPS
 SESSION_COOKIE_SECURE = HTTPS
 ```
 
-This is logically coherent, but the repository's example configuration explicitly contains:
+The example environment contains:
 
 ```text
 HTTPS=off
+SITH_DEBUG=true
 ```
 
-For an application handling accounts and transactions, this creates a significant deployment foot-gun.
+This is acceptable for local development but dangerous as a template if copied into a deployment without deliberate review.
 
-### Recommendation
+### Resolution
 
-For production, make HTTPS mandatory rather than configurable to insecure mode.
+Separate development and production examples:
 
-Recommended baseline:
+```text
+.env.example
+.env.production.example
+```
+
+Production should enforce:
 
 ```python
 SESSION_COOKIE_SECURE = True
 CSRF_COOKIE_SECURE = True
 SESSION_COOKIE_HTTPONLY = True
 SECURE_SSL_REDIRECT = True
+```
+
+If TLS is terminated by a reverse proxy, configure and test Django's proxy-awareness correctly.
+
+Add HSTS only after confirming that the entire intended HTTPS domain tree is safe:
+
+```python
 SECURE_HSTS_SECONDS = 31536000
 SECURE_HSTS_INCLUDE_SUBDOMAINS = True
 SECURE_HSTS_PRELOAD = True
 ```
 
-Only enable HSTS preload/includeSubDomains after verifying that every relevant subdomain is HTTPS-capable.
-
-If TLS is terminated at a reverse proxy, correctly configure Django's proxy SSL handling and verify it with integration tests.
+Do not enable `includeSubDomains` or preload blindly.
 
 ---
 
-### SEC-004 — Privileged production deployment over GitHub Actions SSH
+## SEC-004 — Privileged production deployment through GitHub Actions
 
-**Severity:** HIGH  
-**Status:** Confirmed  
+**Severity: HIGH**  
 **Location:** `.github/workflows/deploy.yml`
 
-The production workflow uses `appleboy/ssh-action` with secrets for a proxy and production server and executes commands directly on the host:
+The production workflow establishes SSH access using GitHub secrets and executes:
 
-- `git fetch`
-- `git reset --hard origin/master`
-- `uv sync --group prod`
-- `npm install`
-- Xapian installation
-- database migrations
-- static collection
-- message compilation
-- `sudo systemctl restart uwsgi`
+```text
+git fetch
+git reset --hard origin/master
+uv sync --group prod
+npm install
+uv run ./manage.py install_xapian
+uv run ./manage.py migrate
+uv run ./manage.py collectstatic --clear --noinput
+uv run ./manage.py compilemessages
+sudo systemctl restart uwsgi
+```
 
-This is effectively a remote root-adjacent deployment capability because the workflow can invoke `sudo`.
+This makes the GitHub workflow a production trust boundary.
 
-### Main risks
+### Attack path
 
-- compromise of the GitHub workflow can become production compromise;
-- mutable third-party actions increase supply-chain exposure;
-- production state is directly modified from CI;
-- `sudo systemctl restart uwsgi` means the deployment account has privileged local capabilities;
-- `git reset --hard origin/master` makes the deployment process destructive to uncommitted server-side state;
-- dependency installation happens directly on the production server.
+A compromise of any component capable of modifying the workflow or executing arbitrary code in the deployment job can potentially become:
 
-### Recommendation
+```text
+GitHub compromise
+       ↓
+CI execution
+       ↓
+SSH credentials
+       ↓
+production host
+       ↓
+sudo/system service
+       ↓
+application/server compromise
+```
 
-Prefer a build-once/deploy-artifact model:
+### Resolution — preferred
 
-1. Build a reproducible artifact/container in CI.
-2. Run security and tests against the artifact.
-3. Sign or checksum the artifact.
-4. Deploy the exact immutable artifact.
-5. Use a narrowly scoped deployment identity.
-6. Restrict `sudo` to the exact required service command through `/etc/sudoers`.
-7. Separate build credentials from deployment credentials.
-8. Add deployment rollback support.
+Move to an immutable artifact model:
 
-If SSH deployment remains, pin the SSH action to a commit SHA and harden the server-side deployment account.
+```text
+commit
+  ↓
+CI
+  ├─ tests
+  ├─ SAST
+  ├─ dependency scan
+  ├─ secret scan
+  ├─ build
+  └─ sign/hash artifact
+       ↓
+artifact registry
+       ↓
+production deployment
+       ↓
+health check
+       ↓
+rollback if unhealthy
+```
+
+The production server should receive an exact artifact, not install arbitrary dependencies during deployment.
+
+### If SSH deployment remains
+
+- dedicated deployment account;
+- no interactive shell if possible;
+- no general-purpose sudo;
+- sudo rule limited to the exact service operation;
+- separate deploy and application users;
+- firewall SSH to GitHub Actions or a deployment network where possible;
+- rotate deployment keys regularly;
+- use host-key verification;
+- record deployment audit logs;
+- support rollback to the previous release.
 
 ---
 
-### SEC-005 — Mutable GitHub Actions references
+## SEC-005 — Third-party GitHub Actions are not immutable
 
-**Severity:** MEDIUM-HIGH  
-**Status:** Confirmed  
+**Severity: HIGH**  
 **Location:** `.github/workflows/*.yml`
 
-Examples include:
+Examples currently include:
 
 ```yaml
-uses: actions/checkout@v6
-uses: actions/setup-python@v6
-uses: pre-commit/action@v3.0.1
-uses: appleboy/ssh-action@v1.2.5
-uses: getsentry/action-release@v1.7.0
+actions/checkout@v6
+actions/setup-python@v6
+pre-commit/action@v3.0.1
+appleboy/ssh-action@v1.2.5
+getsentry/action-release@v1.7.0
 ```
 
-Version tags can move. A compromised or unexpectedly changed upstream tag could modify the code executed with repository/production privileges.
+Version tags are not immutable references.
 
-### Recommendation
+### Resolution
 
-Pin every third-party GitHub Action to an immutable commit SHA and document the corresponding release version in a comment.
-
-Example pattern:
+Pin third-party actions to full commit SHAs:
 
 ```yaml
-uses: actions/checkout@<IMMUTABLE_COMMIT_SHA> # v6
+uses: actions/checkout@<commit-sha> # v6
 ```
 
-Use Dependabot to propose updates while retaining SHA pinning.
+Do this especially for:
+
+- SSH/deployment actions;
+- actions with secrets;
+- actions with write permissions;
+- actions executed before security checks.
+
+Use Dependabot/Renovate to update pinned SHAs automatically.
 
 ---
 
-### SEC-006 — Public repository and sensitive application scope
+## SEC-006 — Application-wide BOLA/IDOR authorization risk
 
-**Severity:** MEDIUM  
-**Status:** Confirmed risk assessment
+**Severity: HIGH**  
+**Status: verify systematically**
 
-The repository is public. The README identifies the application as the source code for the UTBM student association website. fileciteturn6file0
+The project contains explicit permission abstractions such as:
 
-The application contains numerous modules including authentication, subscriptions, e-commerce, accounting-related functionality, forum functionality, student profiles, API functionality, and administrative components.
+- `IsInGroup`
+- `HasPerm`
+- `IsRoot`
+- `IsSubscriber`
+- `CanView`
+- `CanEdit`
+- `IsOwner`
 
-A public repository is not inherently insecure, but the impact of any accidental secret, fixture containing personal data, production export, debug artifact, or private operational configuration is higher.
+This is a good architectural foundation. The API documentation also explicitly distinguishes global and object-level permissions.
 
-### Recommendation
+However, the application has enough modules and object identifiers that static inspection cannot prove that every endpoint consistently enforces object ownership/visibility.
 
-Perform a dedicated historical secret/data scan covering:
+### High-value targets
 
-- all Git history;
-- tags/releases;
-- deleted files;
-- GitHub Actions artifacts;
-- documentation examples;
-- fixtures and test data;
-- generated files;
-- logs and database dumps.
-
-Use GitHub secret scanning/push protection where available and complement it with a local scanner such as Gitleaks.
-
-If any real credential has ever been committed, rotate it immediately; removing the file from the current tree is not sufficient.
-
----
-
-### SEC-007 — Dependency security requires independent verification
-
-**Severity:** MEDIUM  
-**Status:** Needs verification
-
-`pyproject.toml` pins dependency versions to ranges rather than fully locking every resolved package. The project uses modern dependencies including Django 5.2.x and several Django extensions. fileciteturn14file0
-
-The repository also includes Dependabot configuration, which is a positive control, but this audit did not have access to a complete dependency vulnerability report.
-
-### Recommendation
-
-Add a CI security stage running at least:
-
-- `uv audit` or an equivalent Python dependency vulnerability scanner;
-- npm dependency audit appropriate to the frontend toolchain;
-- OS/container scanning if containers are used;
-- secret scanning;
-- SAST.
-
-Fail CI on critical vulnerabilities and define a remediation SLA for high-severity vulnerabilities.
-
----
-
-### SEC-008 — No dedicated security gates visible in inspected CI
-
-**Severity:** MEDIUM  
-**Status:** Confirmed for inspected workflow
-
-The inspected CI workflow runs pre-commit checks and tests/coverage. fileciteturn15file0
-
-There is no visible dedicated job for:
-
-- SAST;
-- dependency vulnerability scanning;
-- secret scanning;
-- IaC scanning;
-- security regression tests;
-- container scanning.
-
-### Recommendation
-
-Add a dedicated `security` job with deterministic tools and explicit failure thresholds.
-
-Suggested minimum stack:
+Test every route containing:
 
 ```text
-gitleaks
-Semgrep
-pip-audit / uv audit
-npm audit or equivalent lockfile scanner
-Trivy (if container/image deployment is introduced)
+/<id>
+/<pk>
+/user/<id>
+/basket/<id>
+/invoice/<id>
+/file/<id>
+/product/<id>
+/subscription/<id>
+/club/<id>
 ```
 
----
+### Test methodology
 
-### SEC-009 — Security headers are only partially hardened
-
-**Severity:** MEDIUM  
-**Status:** Confirmed / needs runtime verification
-
-The settings include:
-
-```python
-X_FRAME_OPTIONS = "SAMEORIGIN"
-```
-
-and Django's clickjacking middleware is enabled. `SecurityMiddleware` is also present. fileciteturn13file0
-
-These are good foundations, but a production security baseline should also verify headers such as:
-
-- `Strict-Transport-Security`
-- `Content-Security-Policy`
-- `Referrer-Policy`
-- `Permissions-Policy`
-- appropriate `Cache-Control` on sensitive responses
-
-### Recommendation
-
-Implement and test a deliberate header policy at the reverse proxy and/or Django layer. CSP deserves particular attention because the application uses a substantial server-rendered template surface.
-
-Do not blindly deploy a restrictive CSP without testing all scripts, styles, images, fonts, and third-party integrations.
-
----
-
-### SEC-010 — Authorization boundaries require a dedicated endpoint audit
-
-**Severity:** MEDIUM  
-**Status:** Needs deeper review
-
-The application contains many Django apps and a dedicated API package. The settings show custom authentication components:
-
-```python
-AUTH_USER_MODEL = "core.User"
-AUTHENTICATION_BACKENDS = ["core.auth.backends.SithModelBackend"]
-```
-
-There are also custom authorization helpers such as `can_edit_prop`, `can_edit`, and `can_view` exposed to templates. fileciteturn13file0
-
-A repository-wide pattern search cannot establish whether every object access is correctly authorized.
-
-### Priority audit targets
-
-Review every endpoint involving:
-
-- user profiles;
-- subscriptions;
-- payments/e-commerce;
-- accounting;
-- documents and uploaded files;
-- forum moderation;
-- club administration;
-- election administration;
-- student data;
-- API endpoints;
-- admin actions;
-- object IDs supplied by users.
-
-Specifically test for IDOR/BOLA vulnerabilities by changing object identifiers between users with different permissions.
-
----
-
-### SEC-011 — Secret-shaped value in `.env.example`
-
-**Severity:** LOW-MEDIUM  
-**Status:** Confirmed
-
-`.env.example` contains a long secret-looking `SECRET_KEY` value while explicitly stating that it is not the production key. fileciteturn11file0
-
-This is not a confirmed credential leak, but it is unnecessarily realistic and can confuse developers or automated secret scanners.
-
-### Recommendation
-
-Use an obviously synthetic value, for example:
+Create at least three accounts:
 
 ```text
-SECRET_KEY=replace-with-a-random-secret
+USER_A = ordinary user
+USER_B = ordinary user
+ADMIN = privileged user
 ```
 
-or generate a value during setup without committing one.
+For each object belonging to A:
+
+1. authenticate as B;
+2. request the object's GET endpoint;
+3. attempt POST/PUT/PATCH;
+4. attempt DELETE;
+5. attempt export/download;
+6. attempt API access;
+7. repeat using guessed/sequential IDs.
+
+Expected result: B must never obtain A's protected object merely by changing the identifier.
+
+### Resolution
+
+Enforce authorization at the queryset/object boundary, not only in templates.
+
+Good pattern:
+
+```python
+self.get_object_or_exception(Model, pk=obj_id)
+self.check_object_permissions(obj)
+```
+
+Better still, restrict the queryset itself where possible so unauthorized objects are never fetched.
 
 ---
 
-### SEC-012 — CI permissions should follow least privilege
+## SEC-007 — Payment callback leaks internal exception information
 
-**Severity:** LOW-MEDIUM  
-**Status:** Needs verification
+**Severity: HIGH**  
+**Location:** `eboutic/views.py`, `EtransactionAutoAnswer`
 
-The inspected CI workflow does not declare a top-level `permissions:` policy. fileciteturn15file0
+The payment callback currently returns:
 
-Explicitly declaring permissions prevents future workflow changes or GitHub defaults from granting more access than necessary.
+```python
+return HttpResponse(
+    "Basket processing failed with error: " + repr(e),
+    status=500,
+)
+```
 
-### Recommendation
+This can expose internal implementation details to the payment provider/client and potentially to an attacker who can trigger exceptional paths.
 
-Start with:
+### Resolution
+
+Return a generic message:
+
+```python
+sentry_sdk.capture_exception(e)
+return HttpResponse("Payment processing failed", status=500)
+```
+
+Log the detailed exception internally with a correlation identifier.
+
+Example:
+
+```text
+Payment processing failed — reference: PAY-2026-000123
+```
+
+Never expose:
+
+- SQL errors;
+- filesystem paths;
+- object representations;
+- configuration values;
+- stack traces;
+- internal identifiers not required by the payment protocol.
+
+---
+
+## SEC-008 — Legacy SHA-1 payment signature verification
+
+**Severity: HIGH**  
+**Location:** `eboutic/views.py`
+
+The callback verifies the payment signature using:
+
+```python
+PKCS1v15()
+SHA1()
+```
+
+This is legacy cryptography.
+
+### Important nuance
+
+If this algorithm is dictated by the payment provider's protocol, replacing it unilaterally may break payment validation. The issue should therefore be treated as **provider/protocol-dependent**, not as an assertion that the current callback is trivially forgeable.
+
+### Resolution
+
+1. Confirm the payment provider's current supported signature algorithms.
+2. Prefer RSA-PSS + SHA-256 or another provider-supported modern construction.
+3. If SHA-1 is mandatory, isolate the legacy verification in one small adapter.
+4. Document why SHA-1 remains required.
+5. Monitor provider migration deadlines.
+6. Add interoperability tests using official provider test vectors.
+
+### Additional callback hardening
+
+Parse the signed fields explicitly rather than assuming that `Sig` is the final query parameter:
+
+```python
+query = request.GET.copy()
+signature = query.pop("Sig", None)
+canonical_data = canonicalize_provider_fields(query)
+```
+
+The canonicalization must follow the payment provider specification exactly.
+
+---
+
+## SEC-009 — Monetary calculations use `float`
+
+**Severity: HIGH**  
+**Location:** `eboutic/models.py`
+
+`Basket.total` converts an aggregate result to `float`:
+
+```python
+return float(
+    self.items.aggregate(...)["total"]
+)
+```
+
+This value is then used in payment-related calculations, including:
+
+```python
+int(self.total * 100)
+```
+
+### Why this matters
+
+Binary floating point is not appropriate for financial invariants. Values such as `10.29` cannot necessarily be represented exactly.
+
+Even if the current database field has fixed precision, converting to `float` introduces a second numeric representation and can create edge cases in payment amount comparisons.
+
+### Resolution
+
+Use `Decimal` end-to-end.
+
+Example principle:
+
+```python
+from decimal import Decimal
+
+ZERO = Decimal("0.00")
+```
+
+Keep currency fields as `Decimal` and convert to integer cents only at the payment-provider boundary:
+
+```python
+amount_cents = int((total * Decimal("100")).quantize(Decimal("1")))
+```
+
+Prefer a dedicated money abstraction if the project grows further.
+
+### Add invariants
+
+For every payment:
+
+```text
+basket total
+==
+provider amount
+==
+invoice total
+==
+sales total
+```
+
+All four should be tested against fractional prices, discounts, large quantities and concurrent requests.
+
+---
+
+## SEC-010 — File/media authorization must be audited end-to-end
+
+**Severity: HIGH**  
+**Status: verify**
+
+The user model contains several file relationships:
+
+- home directory;
+- profile picture;
+- avatar;
+- scrub picture.
+
+The application also defines a media root and exposes `/data/`.
+
+### Main risk
+
+Authorization implemented on an HTML page is not sufficient if the underlying file URL is directly accessible.
+
+A private profile/document must remain private when its direct URL is known.
+
+### Resolution
+
+Classify files:
+
+```text
+PUBLIC
+PRIVATE_USER
+PRIVATE_GROUP
+PRIVATE_ADMIN
+TEMPORARY
+```
+
+Then enforce access before returning the file.
+
+For private files:
+
+```text
+browser
+  ↓
+Django authorization
+  ↓
+short-lived signed URL or streaming response
+  ↓
+object storage/private filesystem
+```
+
+Avoid putting protected files directly under a public web-server directory.
+
+### Tests
+
+- authenticated A downloads A's private file: allowed;
+- B downloads A's file: denied;
+- anonymous download: denied;
+- guessed ID/path: denied;
+- deleted object URL: denied;
+- renamed/moved object: old URL cannot bypass authorization.
+
+---
+
+## SEC-011 — Custom API-key authentication and permissions
+
+**Severity: MEDIUM-HIGH**  
+**Location:** `api/auth.py`, `api/models.py`, `api/permissions.py`
+
+The API uses an `X-APIKey` header. The key is hashed before database lookup, which is a good practice.
+
+The API client can also receive:
+
+- groups;
+- individual Django permissions.
+
+This creates a powerful authorization system.
+
+### Positive control
+
+Only the hash is stored in `ApiKey`, and revoked keys are excluded from authentication.
+
+### Risks to verify
+
+- API keys may have excessive permissions;
+- no visible expiration mechanism;
+- no visible last-used timestamp;
+- no visible per-key audit trail;
+- compromised keys may remain valid indefinitely until revoked;
+- client permission cache can become stale within an object lifetime;
+- all controllers need explicit authentication/authorization review.
+
+### Resolution
+
+Add to `ApiKey`:
+
+```text
+created_at
+expires_at
+last_used_at
+revoked_at
+revoked_by
+```
+
+Optionally add:
+
+```text
+allowed_ips
+purpose
+```
+
+Use key rotation and short-lived credentials for automation.
+
+Log security events without logging the actual key:
+
+```text
+api_key_prefix
+client_id
+endpoint
+user/owner
+result
+timestamp
+request_id
+```
+
+### API policy
+
+Default should be deny.
+
+Every controller should explicitly state:
+
+```text
+anonymous allowed?
+session allowed?
+API key allowed?
+required permission?
+object permission?
+```
+
+---
+
+## SEC-012 — Production installs dependencies directly on the host
+
+**Severity: MEDIUM-HIGH**  
+**Location:** `.github/workflows/deploy.yml`
+
+The deployment executes:
+
+```text
+uv sync --group prod
+npm install
+```
+
+on the production machine.
+
+### Risks
+
+- deployment behavior depends on server state;
+- build is not identical to what CI tested;
+- network/package availability can affect production deployment;
+- compromised dependency infrastructure can affect deployment;
+- rollback is more complicated;
+- the production host performs build-like operations.
+
+### Resolution
+
+Build in CI:
+
+```text
+uv lock / npm lock
+        ↓
+CI build
+        ↓
+security scan
+        ↓
+artifact
+        ↓
+production
+```
+
+Use lockfiles consistently and fail if the lockfile is not respected.
+
+Prefer `npm ci` rather than `npm install` for deterministic CI/deployment installs when the project uses npm lockfiles.
+
+---
+
+## SEC-013 — Missing dedicated security CI gates
+
+**Severity: MEDIUM**
+
+The inspected CI runs pre-commit and tests/coverage, but no dedicated security pipeline was visible.
+
+### Resolution
+
+Add a separate `security` job:
+
+```text
+secret scan
+   ↓
+SAST
+   ↓
+dependency scan
+   ↓
+IaC/workflow scan
+   ↓
+security tests
+```
+
+Recommended tooling:
+
+- Gitleaks or equivalent secret scanner;
+- Semgrep;
+- `pip-audit` or equivalent for Python dependencies;
+- npm lockfile audit;
+- Trivy for container/filesystem scanning if containers are introduced;
+- GitHub dependency review for pull requests.
+
+### Failure policy
+
+Block merge/deployment on:
+
+- confirmed secret;
+- critical dependency vulnerability;
+- high-severity SAST issue without an accepted exception;
+- failed security regression test.
+
+---
+
+## SEC-014 — GitHub Actions permissions should be explicit
+
+**Severity: MEDIUM**
+
+The inspected workflows do not define a restrictive top-level permissions policy.
+
+### Resolution
+
+Default to:
 
 ```yaml
 permissions:
   contents: read
 ```
 
-Then grant write permissions only to the specific jobs that genuinely require them.
+Then grant individual permissions only to jobs that require them.
 
-The production deployment job should be isolated and should receive only the permissions it requires.
+For example, a deployment workflow should not automatically inherit write permissions to repository contents if it only needs to read code and use external deployment credentials.
 
----
-
-## 4. Positive security controls already present
-
-The audit found several good practices that should be retained:
-
-- `DEBUG` defaults to `False`. fileciteturn13file0
-- `SECRET_KEY` is loaded from the environment instead of hard-coded in application settings. fileciteturn13file0
-- CSRF middleware is enabled. fileciteturn13file0
-- Session and CSRF secure-cookie flags are available and tied to HTTPS. fileciteturn13file0
-- Clickjacking protection is enabled through `XFrameOptionsMiddleware`. fileciteturn13file0
-- Jinja autoescaping is enabled. fileciteturn13file0
-- `.env`, SQLite databases, logs, virtual environments, node modules and several generated directories are ignored by Git. fileciteturn12file0
-- Dependabot is configured in the repository. fileciteturn7file0
-- CI executes automated tests and coverage. fileciteturn15file0
-- The dependency file documents SHA-256 hashes for Xapian components to mitigate supply-chain attacks. fileciteturn14file0
-
-These controls provide a useful baseline; the main issue is that production hardening is not sufficiently fail-closed.
+Also separate deployment into a dedicated environment with approval rules.
 
 ---
 
-## 5. Recommended remediation plan
+## SEC-015 — Security headers are incomplete at application level
 
-### P0 — Immediate
+**Severity: MEDIUM**
 
-- [ ] Replace `ALLOWED_HOSTS = ["*"]` with an explicit production allow-list.
-- [ ] Confirm production has `DEBUG=False`.
-- [ ] Force HTTPS in production.
-- [ ] Confirm `SESSION_COOKIE_SECURE=True` and `CSRF_COOKIE_SECURE=True`.
-- [ ] Audit the production reverse proxy for Host-header handling.
-- [ ] Rotate any credential found during a complete Git-history scan.
-- [ ] Verify the GitHub deployment key is dedicated to deployment and cannot obtain unnecessary privileges.
-- [ ] Restrict the deployment user's `sudo` permissions to the minimum required command(s).
+The application has clickjacking protection and `SecurityMiddleware`, which is good.
 
-### P1 — Short term
-
-- [ ] Pin every third-party GitHub Action to a commit SHA.
-- [ ] Add `permissions: contents: read` by default to CI workflows.
-- [ ] Add Gitleaks/secret scanning to CI.
-- [ ] Add Python dependency vulnerability scanning.
-- [ ] Add JavaScript dependency vulnerability scanning.
-- [ ] Add SAST with Semgrep or equivalent.
-- [ ] Add production configuration tests that fail CI when insecure settings are detected.
-- [ ] Add HSTS and a deliberate security-header policy.
-- [ ] Replace the secret-looking `.env.example` value with a clearly synthetic placeholder.
-
-### P2 — Medium term
-
-- [ ] Perform a complete authorization/IDOR/BOLA audit of all API and object-based views.
-- [ ] Review file upload/download authorization and path handling.
-- [ ] Review all administrative actions for privilege escalation.
-- [ ] Review password-reset, email-verification, session, logout and account-recovery flows.
-- [ ] Review rate limiting on login, password reset, CAPTCHA-protected endpoints and public APIs.
-- [ ] Review sensitive response caching and browser cache headers.
-- [ ] Review logging to ensure passwords, tokens, personal data and payment information are never logged.
-- [ ] Move production deployment toward immutable artifacts instead of server-side dependency installation.
-
----
-
-## 6. Security test matrix to add
-
-| Area | Test |
-|---|---|
-| Host header | Reject unknown `Host` values |
-| HTTPS | HTTP redirects to HTTPS; secure cookies remain enabled |
-| CSRF | State-changing requests without valid CSRF token fail |
-| Authentication | Brute-force/rate-limit behavior is bounded |
-| Authorization | User A cannot read/modify User B objects |
-| Privilege escalation | Normal user cannot invoke admin operations |
-| IDOR/BOLA | Changing object IDs never bypasses permissions |
-| File access | Private uploads cannot be accessed anonymously or by another user |
-| Uploads | Dangerous extensions/content types are rejected or safely handled |
-| XSS | User-controlled forum/profile/content fields remain escaped/sanitized |
-| SQL injection | User input remains parameterized through Django ORM/raw SQL review |
-| CSRF | API/session authentication combinations cannot bypass CSRF requirements |
-| Session | Logout invalidates the expected session state |
-| Password reset | Tokens expire, are single-use, and do not disclose account existence unnecessarily |
-| Secrets | Repository and Git history contain no active credentials |
-| CI/CD | Pull requests cannot obtain production deployment privileges unexpectedly |
-| Dependencies | Known critical/high vulnerabilities fail security CI |
-| Headers | HSTS/CSP/Referrer-Policy/etc. meet the documented baseline |
-| Production config | Insecure configuration causes startup/CI failure |
-
----
-
-## 7. Suggested secure baseline
-
-A production baseline should converge toward:
+However, a modern production baseline should explicitly verify:
 
 ```text
-DEBUG=False
-HTTPS=True
-ALLOWED_HOSTS=<explicit production hosts>
-SESSION_COOKIE_SECURE=True
-SESSION_COOKIE_HTTPONLY=True
-CSRF_COOKIE_SECURE=True
-SECURE_SSL_REDIRECT=True
-SECURE_HSTS_SECONDS=<validated value>
-SECURE_CONTENT_TYPE_NOSNIFF=True
-X_FRAME_OPTIONS=SAMEORIGIN
+Strict-Transport-Security
+Content-Security-Policy
+Referrer-Policy
+Permissions-Policy
+Cache-Control on sensitive responses
+X-Content-Type-Options
 ```
 
-In addition:
+### Resolution
+
+Prefer configuring stable infrastructure headers at the reverse proxy where appropriate, while keeping application-specific policy in Django.
+
+### CSP migration strategy
+
+Do not blindly add a restrictive CSP.
+
+Start with report-only mode:
 
 ```text
-GitHub Actions: immutable SHA-pinned actions
-CI permissions: least privilege
-Secrets: GitHub/environment secret store only
-Deployment: immutable artifact
-Production SSH: dedicated restricted identity
-SAST: enabled
-Secret scanning: enabled
-Dependency scanning: enabled
-Authorization tests: mandatory
+Content-Security-Policy-Report-Only
 ```
+
+Collect violations, remove unnecessary inline/eval behavior, then enforce the policy.
 
 ---
 
-## 8. Final verdict
+## SEC-016 — Historical secret/data exposure needs a dedicated scan
 
-**Do not consider the current repository configuration fully production-hardened.**
+**Severity: MEDIUM**
 
-The most important immediate issue is the wildcard `ALLOWED_HOSTS`, followed by ensuring that production cannot accidentally run with insecure HTTP/cookie settings and by reducing the trust placed in the GitHub Actions → SSH → `sudo` deployment chain.
+The current `.env.example` contains a secret-shaped value that is documented as non-production. This is not itself evidence of a production secret leak.
 
-The next major security activity should be an **authorization and sensitive-data audit**, because the repository's breadth makes access-control mistakes potentially more damaging than classic framework misconfiguration.
+However, because the repository is public, the following must be scanned:
 
-### Priority order
+```text
+entire Git history
+tags
+releases
+deleted files
+fixtures
+logs
+SQL dumps
+coverage artifacts
+CI artifacts
+documentation
+example configuration
+```
 
-1. **Fix `ALLOWED_HOSTS`.**
-2. **Enforce HTTPS/security cookies in production.**
-3. **Introduce fail-closed production security checks.**
-4. **Harden GitHub Actions and pin third-party actions.**
-5. **Audit/rotate secrets across Git history.**
-6. **Add SAST + secret + dependency scanning.**
-7. **Perform endpoint-by-endpoint authorization/IDOR testing.**
-8. **Move toward immutable, least-privilege deployments.**
+### Resolution
 
-**Audit conclusion: HIGH risk until P0 findings are remediated; medium residual risk is expected afterward until authorization and runtime penetration testing are completed.**
+Run:
+
+```text
+gitleaks detect --redact
+```
+
+and a second independent scanner if possible.
+
+If a real credential is found:
+
+1. revoke/rotate it;
+2. invalidate dependent sessions/tokens;
+3. remove it from the repository;
+4. clean historical exposure if required;
+5. inspect CI artifacts and caches;
+6. document the incident.
+
+Removing the file from the latest commit is not enough.
+
+---
+
+## SEC-017 — Custom authentication middleware requires dedicated testing
+
+**Severity: MEDIUM**
+
+The application uses a custom authentication middleware and a custom Django authentication backend.
+
+Custom authentication code increases the importance of regression testing around:
+
+- login;
+- logout;
+- session rotation;
+- password change;
+- password reset;
+- account disablement;
+- staff/superuser transitions;
+- group changes;
+- anonymous requests;
+- stale sessions after privilege changes.
+
+### Resolution
+
+Add security tests for privilege transitions.
+
+Example:
+
+```text
+USER has normal rights
+       ↓
+grant admin group
+       ↓
+rights appear
+       ↓
+remove admin group
+       ↓
+old session/token no longer retains admin rights
+```
+
+This is especially important because permissions are cached in several custom properties.
+
+---
+
+## SEC-018 — Payment/basket concurrency and replay
+
+**Severity: MEDIUM**
+
+The payment callback already uses `select_for_update()` and deletes the basket after successful processing. This is a positive control against straightforward duplicate callback processing.
+
+However, payment flows deserve explicit concurrency tests.
+
+### Test cases
+
+Run two identical successful callbacks simultaneously:
+
+```text
+callback A ─┐
+            ├─ same BasketID
+callback B ─┘
+```
+
+Expected:
+
+- exactly one invoice;
+- exactly one set of sales/refilling records;
+- exactly one successful finalization;
+- second callback handled safely and idempotently.
+
+### Better design
+
+Introduce a payment transaction entity:
+
+```text
+PaymentTransaction
+------------------
+id
+provider
+provider_transaction_id
+basket
+amount
+currency
+status
+signature_verified_at
+processed_at
+created_at
+```
+
+Add a unique constraint on the provider transaction identifier.
+
+This makes idempotency explicit rather than relying primarily on basket deletion.
+
+---
+
+## SEC-019 — Logging and error reporting privacy
+
+**Severity: MEDIUM**
+
+The settings contain logging to stdout and a dedicated `account_dump_mail.log`.
+
+The application also uses Sentry.
+
+### Risks to verify
+
+Sensitive information can accidentally enter logs through:
+
+- request bodies;
+- query parameters;
+- email addresses;
+- billing information;
+- exception representations;
+- payment callback payloads;
+- authentication failures;
+- uploaded file paths.
+
+### Resolution
+
+Define a logging policy:
+
+```text
+NEVER log:
+passwords
+API keys
+session cookies
+payment secrets
+full billing information
+personal data unless necessary
+```
+
+Use structured logs and a request/correlation ID.
+
+Configure Sentry scrubbing for:
+
+```text
+Authorization
+Cookie
+Set-Cookie
+X-APIKey
+password
+secret
+billing fields
+```
+
+Also define retention periods.
+
+---
+
+## SEC-020 — Dependency vulnerability state not independently verified
+
+**Severity: MEDIUM**
+
+The project has dependency management and Dependabot, but this audit did not execute a full resolved dependency vulnerability scan against the installed dependency graph.
+
+### Resolution
+
+Make the resolved dependency set auditable.
+
+Recommended pipeline:
+
+```text
+lockfile
+  ↓
+audit
+  ↓
+SBOM
+  ↓
+vulnerability database
+  ↓
+policy
+```
+
+Generate an SBOM in CycloneDX or SPDX format if practical.
+
+Track exceptions with:
+
+```text
+CVE
+severity
+reason
+compensating control
+owner
+expiry date
+```
+
+Never allow permanent undocumented exceptions.
+
+---
+
+## SEC-021 — Realistic secret-shaped value in `.env.example`
+
+**Severity: LOW-MEDIUM**
+
+`.env.example` contains a long secret-shaped `SECRET_KEY` even though it states that it is not the production key.
+
+### Resolution
+
+Replace with:
+
+```text
+SECRET_KEY=replace-me-with-a-random-secret
+```
+
+or generate it automatically during setup.
+
+This reduces confusion and secret-scanner noise.
+
+---
+
+## SEC-022 — API key lifecycle and observability
+
+**Severity: LOW-MEDIUM**
+
+The current API key model has creation and revocation, which is useful, but a mature credential-management model should include expiration, usage tracking and rotation.
+
+### Resolution
+
+Implement:
+
+```text
+create
+show-once
+use
+expire
+rotate
+revoke
+revoke-all
+```
+
+Never show an API key again after creation.
+
+Use the prefix only for identification in the UI/logs.
+
+---
+
+## SEC-023 — Availability and resource exhaustion
+
+**Severity: LOW-MEDIUM / VERIFY**
+
+The application contains potentially expensive features:
+
+- search/Xapian;
+- image processing;
+- PDF generation;
+- file operations;
+- formsets;
+- e-commerce operations;
+- Celery tasks.
+
+The e-boutique formset is explicitly configured with `absolute_max=None`.
+
+### Resolution
+
+Put hard resource limits around user-controlled collections.
+
+For example:
+
+```text
+maximum basket items
+maximum quantity per item
+maximum upload size
+maximum image dimensions
+maximum PDF generation workload
+maximum request body size
+maximum task runtime
+```
+
+Add application-level and reverse-proxy rate limiting for expensive endpoints.
+
+Do not rely solely on frontend validation.
+
+---
+
+## SEC-024 — Database constraints and indexes
+
+**Severity: LOW-MEDIUM / VERIFY**
+
+Security-sensitive state should be enforced as much as possible at the database level.
+
+### Recommended constraints
+
+Payment:
+
+```text
+provider_transaction_id UNIQUE
+```
+
+API key:
+
+```text
+hashed_key UNIQUE
+```
+
+Business invariants:
+
+```text
+quantity > 0
+amount >= 0 where appropriate
+```
+
+Authorization relationships should use foreign keys with deliberate `on_delete` semantics.
+
+Add indexes for frequent security-sensitive lookups such as:
+
+```text
+revoked + hashed_key
+user_id
+owner_id
+basket_id
+invoice_id
+subscription dates
+```
+
+Review indexes using real production query plans before adding them blindly.
+
+---
+
+# 4. Payment security deep review
+
+Payment functionality deserves its own security boundary because a compromise can directly become a financial integrity incident.
+
+## Required invariants
+
+For every successful payment:
+
+```text
+1. provider signature is valid
+2. provider transaction is authentic
+3. provider amount == server basket amount
+4. provider currency == expected currency
+5. basket belongs to the expected customer
+6. basket is payable
+7. transaction has not already been processed
+8. invoice is generated exactly once
+9. sales/refilling records are generated exactly once
+10. basket is finalized atomically
+```
+
+The current callback verifies the amount against the basket and uses a database transaction plus row locking. These are good controls.
+
+### Recommended state machine
+
+Replace implicit state with an explicit payment state machine:
+
+```text
+CREATED
+   ↓
+PAYMENT_STARTED
+   ↓
+AUTHORIZED
+   ↓
+PROCESSING
+   ↓
+COMPLETED
+```
+
+Failure states:
+
+```text
+FAILED
+EXPIRED
+CANCELLED
+REJECTED
+```
+
+Transitions must be validated server-side.
+
+Never allow:
+
+```text
+COMPLETED → AUTHORIZED
+COMPLETED → CREATED
+```
+
+without an explicit administrative reconciliation process.
+
+---
+
+# 5. Authentication security test plan
+
+## Account lifecycle
+
+- [ ] login with valid credentials;
+- [ ] login with invalid credentials;
+- [ ] user enumeration resistance;
+- [ ] password reset token expiration;
+- [ ] password reset token single use;
+- [ ] session rotation after login;
+- [ ] logout invalidates session;
+- [ ] password change invalidates old sessions if policy requires;
+- [ ] disabled account cannot authenticate;
+- [ ] deleted account cannot authenticate;
+- [ ] privilege downgrade invalidates cached privileges.
+
+## Session
+
+- [ ] Secure flag in production;
+- [ ] HttpOnly;
+- [ ] SameSite policy appropriate to integrations;
+- [ ] session fixation test;
+- [ ] CSRF on all state-changing browser endpoints;
+- [ ] session expiration;
+- [ ] concurrent session policy if required.
+
+---
+
+# 6. Authorization test plan
+
+For each role:
+
+```text
+anonymous
+ordinary user
+subscriber
+old subscriber
+club member
+module administrator
+root/superuser
+API client
+```
+
+Build an authorization matrix:
+
+| Resource | Anonymous | User | Subscriber | Admin | Root |
+|---|---:|---:|---:|---:|---:|
+| Public pages | R | R | R | R | R |
+| Own profile | -/R | R/W | R/W | R/W | R/W |
+| Other profile | - | policy | policy | R | R/W |
+| Own basket | - | R/W | R/W | policy | R/W |
+| Other basket | - | - | - | policy | R/W |
+| Own invoice | - | R | R | policy | R/W |
+| Other invoice | - | - | - | policy | R/W |
+| Admin data | - | - | - | module | R/W |
+| API administration | - | - | - | restricted | restricted |
+
+The exact expected matrix must be confirmed with the business owners.
+
+### Critical rule
+
+A hidden button is **not** authorization.
+
+Authorization must be enforced server-side for every read/write/export/delete operation.
+
+---
+
+# 7. XSS review strategy
+
+The application uses Jinja with autoescaping enabled, which is positive.
+
+Nevertheless, review every use of:
+
+```text
+|safe
+mark_safe
+format_html
+HTML() / raw HTML construction
+Markdown rendering
+user-generated forum content
+signatures
+quotes
+product descriptions
+club pages
+```
+
+### Recommended architecture
+
+User content should follow:
+
+```text
+raw input
+ ↓
+validation
+ ↓
+allowed markup parser/sanitizer
+ ↓
+stored canonical representation
+ ↓
+autoescaped rendering
+```
+
+Do not solve XSS with output escaping alone if the application intentionally permits HTML/Markdown.
+
+---
+
+# 8. CSRF review strategy
+
+Django CSRF middleware is enabled.
+
+Audit all state-changing routes, especially:
+
+```text
+POST
+PUT
+PATCH
+DELETE
+AJAX/fetch
+fragment requests
+payment initiation
+profile changes
+file operations
+basket/payment operations
+administrative actions
+```
+
+For each browser-authenticated endpoint, verify:
+
+```text
+no token → 403
+invalid token → 403
+valid token → allowed
+```
+
+Any endpoint intentionally exempted from CSRF must be explicitly documented and use another strong authentication mechanism.
+
+---
+
+# 9. SSRF / outbound request review
+
+Because the application contains integrations and background jobs, perform a dedicated search for any feature where users can influence a URL.
+
+Review:
+
+```text
+requests
+httpx
+urllib
+urlopen
+webhooks
+image imports
+remote file imports
+avatar/profile imports
+callback URLs
+```
+
+If a user-controlled URL is fetched server-side, block:
+
+```text
+127.0.0.0/8
+10.0.0.0/8
+172.16.0.0/12
+192.168.0.0/16
+169.254.169.254
+::1
+RFC1918 IPv6 equivalents
+```
+
+Also protect against DNS rebinding by resolving and validating the destination immediately before connection where applicable.
+
+---
+
+# 10. File upload review
+
+For every upload endpoint, enforce:
+
+```text
+maximum byte size
+maximum dimensions
+allowed MIME types
+allowed extensions
+content sniffing
+safe generated filenames
+storage outside executable web roots
+image re-encoding where appropriate
+```
+
+Do not trust:
+
+```text
+filename
+Content-Type
+extension
+client-side validation
+```
+
+Pillow-based image handling should also have explicit decompression/resource limits where applicable.
+
+---
+
+# 11. SQL injection and ORM review
+
+Django ORM provides strong SQL-injection protection when used normally.
+
+Still audit all uses of:
+
+```text
+raw()
+RawSQL()
+extra()
+cursor.execute()
+SQL fragments
+search query construction
+ordering from user input
+```
+
+For dynamic ordering/filtering, use allow-lists rather than concatenating arbitrary SQL identifiers.
+
+---
+
+# 12. Command execution review
+
+The application and deployment system should be reviewed for:
+
+```text
+subprocess
+os.system
+os.popen
+shell=True
+management command invocation
+Celery tasks launching external binaries
+PDF/image converters
+Xapian utilities
+```
+
+The repository search performed during this audit did not establish a confirmed application-level command injection path, but this area remains important because the application has management commands and external tooling.
+
+If command execution is necessary:
+
+- never interpolate user input into shell strings;
+- use argument arrays;
+- use `shell=False`;
+- allow-list executable paths;
+- run under a restricted OS account;
+- enforce timeouts;
+- cap output/resource consumption.
+
+---
+
+# 13. CI/CD security target architecture
+
+Current model:
+
+```text
+GitHub
+  ↓
+workflow
+  ↓
+SSH
+  ↓
+production host
+  ↓
+install/build/migrate
+  ↓
+restart service
+```
+
+Recommended model:
+
+```text
+Pull Request
+   ↓
+Lint
+   ↓
+Unit tests
+   ↓
+Integration tests
+   ↓
+SAST
+   ↓
+Secret scan
+   ↓
+Dependency scan
+   ↓
+Build immutable artifact
+   ↓
+Artifact scan
+   ↓
+Approval
+   ↓
+Deploy exact artifact
+   ↓
+DB migration strategy
+   ↓
+Health checks
+   ↓
+Smoke tests
+   ↓
+Promote
+   ↓
+Rollback capability
+```
+
+### Deployment principles
+
+- build once;
+- deploy the same artifact tested by CI;
+- no `npm install` on production;
+- no mutable dependency resolution on production;
+- no arbitrary shell access from the application deployment process;
+- explicit production approval;
+- immutable release identifier;
+- automatic health verification;
+- documented rollback.
+
+---
+
+# 14. Recommended GitHub workflow hardening
+
+Add:
+
+```yaml
+permissions:
+  contents: read
+```
+
+Use SHA-pinned actions.
+
+Separate security scanning from deployment.
+
+Require the production environment for deployment and configure:
+
+```text
+required reviewers
+deployment branch restrictions
+secret separation
+environment protection
+```
+
+Prefer short-lived credentials where the deployment platform supports them.
+
+Never expose deployment credentials to pull-request code from untrusted forks.
+
+---
+
+# 15. Production configuration baseline
+
+The following is a target baseline, not a copy/paste configuration:
+
+```python
+DEBUG = False
+
+ALLOWED_HOSTS = [
+    "ae.utbm.fr",
+]
+
+SESSION_COOKIE_SECURE = True
+SESSION_COOKIE_HTTPONLY = True
+CSRF_COOKIE_SECURE = True
+
+SECURE_SSL_REDIRECT = True
+SECURE_HSTS_SECONDS = 31536000
+SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+SECURE_HSTS_PRELOAD = True
+
+X_FRAME_OPTIONS = "DENY"  # use SAMEORIGIN only if the application requires framing
+SECURE_CONTENT_TYPE_NOSNIFF = True
+SECURE_REFERRER_POLICY = "strict-origin-when-cross-origin"
+```
+
+CSP should be designed from actual application dependencies rather than blindly copied.
+
+---
+
+# 16. Security regression suite to implement
+
+Create a dedicated test package such as:
+
+```text
+security_tests/
+├── test_authentication.py
+├── test_authorization.py
+├── test_csrf.py
+├── test_host_header.py
+├── test_security_headers.py
+├── test_api_auth.py
+├── test_api_bola.py
+├── test_file_access.py
+├── test_payment_integrity.py
+├── test_payment_replay.py
+├── test_payment_concurrency.py
+├── test_money_precision.py
+└── test_upload_security.py
+```
+
+## Minimum mandatory tests
+
+### Host header
+
+```text
+unknown Host → 400
+```
+
+### Authorization
+
+```text
+A object + B credentials → 403/404
+```
+
+### API
+
+```text
+missing API key → 401/403
+revoked API key → 401/403
+wrong permission → 403
+correct permission → success
+```
+
+### Payment
+
+```text
+invalid signature → rejected
+wrong amount → rejected
+wrong currency → rejected
+replayed transaction → idempotent
+concurrent callback → one financial result
+```
+
+### Money
+
+```text
+0.01 + 0.02 == 0.03
+10.29 * 100 == 1029 cents
+```
+
+Do not test financial calculations through `float`.
+
+---
+
+# 17. Priority remediation roadmap
+
+## P0 — Before treating production as hardened
+
+- [ ] Remove `ALLOWED_HOSTS=["*"]`.
+- [ ] Enforce `DEBUG=False` in production.
+- [ ] Enforce HTTPS and secure cookies in production.
+- [ ] Remove exception details from payment HTTP responses.
+- [ ] Verify the complete payment callback security model.
+- [ ] Perform an authorization/IDOR/BOLA test campaign.
+- [ ] Audit direct/private file access.
+- [ ] Scan full Git history for secrets.
+- [ ] Rotate any credential found in history.
+- [ ] Pin deployment actions to immutable SHAs.
+- [ ] Restrict deployment SSH/sudo privileges.
+
+## P1 — Security engineering
+
+- [ ] Add dedicated security CI.
+- [ ] Add SAST.
+- [ ] Add dependency vulnerability scanning.
+- [ ] Add secret scanning and push protection.
+- [ ] Add security headers.
+- [ ] Replace payment money `float` operations with `Decimal`.
+- [ ] Introduce explicit payment transaction/idempotency records.
+- [ ] Add API key expiration and rotation.
+- [ ] Add security-event logging and Sentry scrubbing.
+- [ ] Add authorization regression tests.
+
+## P2 — Architecture hardening
+
+- [ ] Move to immutable build artifacts.
+- [ ] Remove dependency installation from production deployment.
+- [ ] Add deployment health checks and rollback.
+- [ ] Produce SBOMs.
+- [ ] Implement CSP report-only then enforcement.
+- [ ] Review file storage architecture.
+- [ ] Add rate limits to expensive operations.
+- [ ] Formalize data retention and privacy controls.
+
+---
+
+# 18. Suggested implementation order
+
+The safest implementation sequence is:
+
+```text
+1. Production configuration hardening
+        ↓
+2. Payment response/error hardening
+        ↓
+3. Authorization test matrix
+        ↓
+4. File/media authorization audit
+        ↓
+5. Payment idempotency + Decimal
+        ↓
+6. CI security gates
+        ↓
+7. GitHub action SHA pinning
+        ↓
+8. Deployment privilege reduction
+        ↓
+9. Immutable artifact deployment
+        ↓
+10. Advanced headers/CSP/rate limiting
+```
+
+This order reduces the highest-risk exposure before larger architectural work.
+
+---
+
+# 19. Final assessment
+
+## Current state
+
+**HIGH RISK — not because the repository contains a confirmed trivial RCE, but because several high-value trust boundaries are weak or insufficiently verified.**
+
+The most concerning boundaries are:
+
+```text
+Internet
+   ↓
+Django host/HTTPS configuration
+   ↓
+Authentication
+   ↓
+Object authorization
+   ↓
+Financial operations
+   ↓
+API credentials
+   ↓
+Private files
+   ↓
+Production deployment
+```
+
+The code already contains useful security abstractions. The main objective should therefore be to **make those controls mandatory, centrally enforced and regression-tested**, rather than adding isolated security checks throughout the codebase.
+
+## Security maturity target
+
+A realistic target architecture is:
+
+```text
+                ┌────────────────────┐
+                │     Internet       │
+                └─────────┬──────────┘
+                          │ HTTPS
+                          ▼
+                ┌────────────────────┐
+                │ Reverse proxy/WAF  │
+                │ rate limits/headers│
+                └─────────┬──────────┘
+                          ▼
+                ┌────────────────────┐
+                │      Django        │
+                │ auth + CSRF + ACL  │
+                └──────┬─────┬───────┘
+                       │     │
+             ┌─────────┘     └──────────┐
+             ▼                          ▼
+      ┌─────────────┐            ┌─────────────┐
+      │ PostgreSQL  │            │ Private file│
+      │ constraints │            │ storage     │
+      └─────────────┘            └─────────────┘
+             │
+             ▼
+      ┌─────────────┐
+      │ Audit logs  │
+      │ + Sentry    │
+      └─────────────┘
+
+CI:
+
+commit → tests → SAST → secrets → dependencies → build → scan → approve → deploy immutable artifact
+```
+
+The repository is in a good position to reach this target because authentication, object permissions, tests, dependency management and deployment automation already exist. The next step should be to turn the recommendations in this document into **security regression tests and small, reviewable pull requests**, starting with P0.
+
+---
+
+## Audit evidence reviewed
+
+Key files reviewed directly during this audit:
+
+- `sith/settings.py`
+- `.env.example`
+- `.gitignore`
+- `pyproject.toml`
+- `.github/workflows/ci.yml`
+- `.github/workflows/deploy.yml`
+- `api/auth.py`
+- `api/models.py`
+- `api/permissions.py`
+- `api/urls.py`
+- `core/auth/backends.py`
+- `core/models.py`
+- `eboutic/models.py`
+- `eboutic/views.py`
+- repository tree and application structure
+
+### Evidence confidence
+
+**Confirmed:** directly visible configuration/code behavior.  
+**Verify:** requires complete endpoint traversal, runtime deployment access, production configuration or dedicated testing.  
+**Recommendation:** architectural improvement rather than an asserted vulnerability.
+
+---
+
+## Conclusion
+
+**Do not consider the application security-complete yet.**
+
+The three areas that deserve the deepest engineering effort are:
+
+1. **Authorization across every object and API endpoint.**
+2. **Financial/payment integrity and idempotency.**
+3. **Production/CI trust boundaries.**
+
+Once these are covered by automated regression tests and production configuration checks, the remaining hardening work becomes much more manageable and measurable.
